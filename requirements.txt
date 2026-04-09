@@ -1,0 +1,8 @@
+# WeChat OCR exporter — CPU 环境可先用 paddlepaddle；若有 NVIDIA GPU 可改用对应 CUDA 版 wheel
+paddlepaddle>=2.5.0
+paddleocr>=2.7.0
+pyautogui>=0.9.54
+PyGetWindow>=0.0.9
+Pillow>=10.0.0
+numpy>=1.24.0
+opencv-python>=4.8.0

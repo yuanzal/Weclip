@@ -1,0 +1,35 @@
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE / OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local runtime / debug outputs
+debug_gui/
+debug_run_*/
+debug_*/
+*.log
+debug_log.json
+
+# OCR exports / screenshots
+wechat_export_*.txt
+wechat_export_*.json
+source.png
+*.tmp.png
+
