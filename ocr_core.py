@@ -48,31 +48,26 @@ def _hsv_bounds(
     return low, high
 
 
+# ocr_core.py 中的核心修改
+
 def get_wechat_window(title: str = "微信"):
-    """获取微信窗口，确保窗口激活且未最小化"""
+    """获取微信窗口，仅尝试激活，不强制阻塞"""
     try:
         wins = gw.getWindowsWithTitle(title)
-    except Exception as e:
-        print(f"❌ 错误：查找窗口失败 — {e}")
+        if not wins:
+            return None
+
+        win = wins[0]
+        # 尝试恢复并激活，但如果失败（例如权限问题）不应抛出异常崩掉整个程序
+        try:
+            if win.isMinimized:
+                win.restore()
+            win.activate()
+        except:
+            pass
+        return win
+    except Exception:
         return None
-
-    if not wins:
-        print(f"❌ 错误：未找到标题包含「{title}」的窗口，请先打开微信。")
-        return None
-
-    win = wins[0]
-    try:
-        if win.isMinimized:
-            win.restore()
-    except Exception as e:
-        print(f"⚠️ 警告：恢复窗口失败，将继续尝试激活 — {e}")
-    try:
-        win.activate()
-    except Exception as e:
-        print(f"⚠️ 警告：激活窗口失败，将继续进行框选 — {e}")
-    time.sleep(0.25)
-    return win
-
 
 def _chat_region(window) -> tuple[int, int, int, int]:
     left, top, w, h = window.left, window.top, window.width, window.height

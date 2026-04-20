@@ -187,31 +187,39 @@ class OcrTunerGUI:
 
     def capture_region(self) -> None:
         title = self.window_title.get().strip() or "微信"
+        # 将 get_wechat_window 移到这里，且不应因找不到窗口而中断流程
         win = get_wechat_window(title)
+
         if win is None:
-            self.status.set(f"未找到标题包含「{title}」的窗口，将直接进入手动框选。")
+            # 如果没找到，只是给个提示，不直接 return
+            self.status.set(f"提示：未找到标题包含「{title}」的窗口，请手动框选任意区域。")
         else:
-            self.status.set(f"已尝试激活窗口「{title}」，请框选聊天区域。")
+            self.status.set(f"已激活窗口「{title}」，请开始框选聊天区域。")
+
+        # 隐藏 GUI 准备截图
         self.root.withdraw()
         self.root.update_idletasks()
-        time.sleep(0.25)
+        time.sleep(0.3)  # 给窗口切换留出时间
+
+        # 进入交互式框选
         region = select_region_interactive()
+
         if not region:
             self.root.deiconify()
-            self.root.lift()
-            self.root.focus_force()
             self.status.set("已取消框选。")
             return
-        # 先截图再恢复GUI，避免把GUI自身覆盖到截图中
+
+        # 截图并恢复 GUI
         shot = pyautogui.screenshot(region=region)
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+
+        # 处理图片
         self.base_img = cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
         self._reset_sample_state()
         self._show_image(self.base_img)
-        self.status.set(f"已截图：{region}，请点击采样颜色。")
-
+        self.status.set(f"截图成功：{region}。接下来请采样颜色或直接预览。")
     def load_image(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("Image files", "*.png;*.jpg;*.jpeg;*.bmp")])
         if not path:

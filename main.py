@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import datetime, timezone
 
 from gui_app import OcrTunerGUI
@@ -15,21 +16,26 @@ from ocr_core import (
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="微信聊天区域截图OCR导出工具（CLI + GUI）")
-    p.add_argument("--gui", action="store_true", help="启动GUI调参工具")
+    argv = sys.argv[1:]
+    if not argv:
+        OcrTunerGUI().run()
+        return
+
+    p = argparse.ArgumentParser(description="微信聊天区域截图 OCR 导出工具（无参启动 GUI，带参数启动 CLI）")
+    p.add_argument("--gui", action="store_true", help="启动 GUI 调参工具")
     p.add_argument("--title", default="微信", help="窗口标题关键字")
-    p.add_argument("--rounds", type=int, default=1, help="滚动采集次数，1=仅当前屏")
+    p.add_argument("--rounds", type=int, default=1, help="滚动采集次数；1=仅当前屏")
     p.add_argument("--pause", type=float, default=0.8, help="每屏滚动后等待秒数")
-    p.add_argument("--out", default="", help="输出路径：.json 或 .txt，默认按时间生成")
+    p.add_argument("--out", default="", help="输出路径；支持 .json 或 .txt，默认按时间生成")
     p.add_argument("--keep-image", default="", help="保存调试截图到指定路径（用于调整坐标）")
-    p.add_argument("--debug-dir", default="", help="调试输出目录：保存掩码、气泡框、裁剪图和debug_log.json")
+    p.add_argument("--debug-dir", default="", help="调试输出目录：保存掩码、气泡框、裁剪图和 debug_log.json")
     p.add_argument(
         "--region",
         choices=("manual", "auto"),
         default="manual",
         help="识别区域：manual=启动后拖动框选（默认）；auto=按窗口布局推算",
     )
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     if args.gui:
         OcrTunerGUI().run()
@@ -37,6 +43,7 @@ def main() -> None:
 
     win = get_wechat_window(args.title)
     if not win:
+        print(f"未找到标题包含“{args.title}”的窗口。")
         return
 
     user_region: tuple[int, int, int, int] | None = None
@@ -47,7 +54,7 @@ def main() -> None:
             print("已取消，未框选区域。")
             return
         print(
-            f"✅ 已选定区域: left={user_region[0]}, top={user_region[1]}, "
+            f"已选定区域: left={user_region[0]}, top={user_region[1]}, "
             f"w={user_region[2]}, h={user_region[3]}"
         )
 
@@ -67,7 +74,7 @@ def main() -> None:
         )
         frames = [rows]
         if args.keep_image:
-            print(f"✅ 已保存调试截图: {args.keep_image}")
+            print(f"已保存调试截图: {args.keep_image}")
     else:
         frames = scroll_and_collect(
             win,
@@ -86,9 +93,9 @@ def main() -> None:
     else:
         export_txt(frames, out, meta)
 
-    total = sum(len(f) for f in frames)
-    print(f"\n🎉 导出完成！共 {len(frames)} 屏、{total} 条有效聊天记录")
-    print(f"📁 文件路径: {out}")
+    total = sum(len(frame) for frame in frames)
+    print(f"\n导出完成：共 {len(frames)} 屏，{total} 条有效聊天记录。")
+    print(f"文件路径: {out}")
 
 
 if __name__ == "__main__":
