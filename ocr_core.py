@@ -366,28 +366,94 @@ def scroll_and_collect(
     pause: float,
     region: tuple[int, int, int, int] | None = None,
     debug_dir: str | None = None,
+    color_config: dict[str, Any] | None = None,
+    progress_callback=None,
 ) -> list[list[dict[str, Any]]]:
     if region is None:
         region = _chat_region(window)
+
     cx = region[0] + region[2] // 2
     cy = region[1] + region[3] // 2
+    scroll_amount = max(300, int(region[3] * 0.6))
+
     pyautogui.click(cx, cy)
-    time.sleep(0.2)
+    time.sleep(0.3)
+
     frames: list[list[dict[str, Any]]] = []
     seen: set[str] = set()
+
     for i in range(rounds):
+        if progress_callback:
+            progress_callback(i + 1, rounds)
+
         frame_debug_dir = str(Path(debug_dir) / f"frame_{i + 1:03d}") if debug_dir else None
-        rows = ocr_chat_region(window, region=region, debug_dir=frame_debug_dir)
+        rows = ocr_chat_region(window, region=region, debug_dir=frame_debug_dir, color_config=color_config)
         fp = _frame_fingerprint(rows)
         if fp in seen:
-            print(f"✅ 第 {i + 1} 屏与已有内容重复，停止滚动。")
+            print(f"duplicate frame at {i + 1}, stop scrolling")
             break
+
         seen.add(fp)
         frames.append(rows)
-        print(f"✅ 已采集第 {i + 1}/{rounds} 屏，本屏 {len(rows)} 条有效聊天。")
-        pyautogui.scroll(8)
+        print(f"captured frame {i + 1}/{rounds}, rows={len(rows)}")
+
+        pyautogui.moveTo(cx, cy)
+        for _ in range(5):
+            pyautogui.scroll(scroll_amount)
+
         time.sleep(pause)
+
     return frames
+
+
+def merge_scrolled_frames(frames: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for rows in frames:
+        normalized_rows = [
+            {
+                "sender": row["sender"],
+                "content": row["content"],
+                "confidence": row.get("confidence"),
+            }
+            for row in rows
+            if row.get("content")
+        ]
+        if not normalized_rows:
+            continue
+        overlap = _find_overlap_size(merged, normalized_rows)
+        merged.extend(normalized_rows[overlap:])
+    return merged
+
+
+def _find_overlap_size(
+    merged: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    max_window: int = 12,
+) -> int:
+    if not merged or not rows:
+        return 0
+    max_overlap = min(len(merged), len(rows), max_window)
+    for size in range(max_overlap, 0, -1):
+        tail = merged[-size:]
+        head = rows[:size]
+        if _rows_match(tail, head):
+            return size
+    return 0
+
+
+def _rows_match(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> bool:
+    if len(left) != len(right):
+        return False
+    for a, b in zip(left, right):
+        if a.get("sender") != b.get("sender"):
+            return False
+        if _normalize_message_text(a.get("content", "")) != _normalize_message_text(b.get("content", "")):
+            return False
+    return True
+
+
+def _normalize_message_text(text: str) -> str:
+    return "".join(str(text).split())
 
 
 def export_txt(frames: list[list[dict[str, Any]]], path: str, meta: dict[str, Any]) -> None:
@@ -395,17 +461,13 @@ def export_txt(frames: list[list[dict[str, Any]]], path: str, meta: dict[str, An
         f.write("# 微信聊天OCR导出记录\n")
         f.write(f"# 生成时间(UTC): {meta.get('generated_utc')}\n")
         f.write(f"# 采集屏数: {len(frames)}\n\n")
-        all_messages: list[dict[str, Any]] = []
-        for rows in frames:
-            all_messages.extend(rows)
+        all_messages = merge_scrolled_frames(frames)
         for msg in all_messages:
             f.write(f"[{msg['sender']}]: {msg['content']}\n")
 
 
 def export_json(frames: list[list[dict[str, Any]]], path: str, meta: dict[str, Any]) -> None:
-    all_messages: list[dict[str, Any]] = []
-    for rows in frames:
-        all_messages.extend(rows)
+    all_messages = merge_scrolled_frames(frames)
     payload = {"meta": meta, "messages": all_messages}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)

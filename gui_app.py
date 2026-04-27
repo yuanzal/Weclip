@@ -22,6 +22,8 @@ from ocr_core import (
     export_json,
     export_txt,
     get_wechat_window,
+    merge_scrolled_frames,
+    scroll_and_collect,
     select_region_interactive,
 )
 
@@ -29,38 +31,53 @@ from ocr_core import (
 class OcrTunerGUI:
     def __init__(self) -> None:
         self.root = tk.Tk()
-        self.root.title("WeChat OCR 调参工具")
-        self.root.geometry("1480x920")
-        self.root.minsize(1320, 820)
-        self.root.configure(bg="#f5f9ff")
+        self.root.title("WeChat OCR 专家级调参工具")
+        self.root.geometry("1500x950")
+        self.root.minsize(1350, 850)
+
+        # 定义全局统一背景色
+        self.bg_color = "#f5f9ff"
+        self.root.configure(bg=self.bg_color)
+
         self.ui_font_family = self._pick_font_family()
         self.root.option_add("*Font", (self.ui_font_family, 11))
 
         self.style = ttk.Style(self.root)
         self.style.theme_use("clam")
-        self.style.configure("TFrame", background="#f5f9ff")
-        self.style.configure("TLabel", background="#f5f9ff", foreground="#1f2d3d")
-        self.style.configure("TLabelframe", background="#f5f9ff", foreground="#2b4b7c", bordercolor="#b9d4f7")
-        self.style.configure("TLabelframe.Label", background="#f5f9ff", foreground="#2b4b7c")
+        self.style.configure("TFrame", background=self.bg_color)
+        self.style.configure("TLabel", background=self.bg_color, foreground="#1f2d3d")
+        self.style.configure("TLabelframe", background=self.bg_color, foreground="#2b4b7c", bordercolor="#b9d4f7")
+        self.style.configure("TLabelframe.Label", background=self.bg_color, foreground="#2b4b7c")
         self.style.configure("TButton", padding=7)
-        self.style.configure("TCheckbutton", background="#f5f9ff", foreground="#1f2d3d")
 
+        # 核心数据状态
         self.base_img: np.ndarray | None = None
         self.preview_imgtk: ImageTk.PhotoImage | None = None
         self.scale_ratio = 1.0
         self.view_offset = (0, 0)
         self.pick_target: str | None = None
+        self.selected_region: tuple[int, int, int, int] | None = None
 
         self.other_hsv: tuple[int, int, int] | None = None
         self.self_hsv: tuple[int, int, int] | None = None
+
+        # 变量绑定
         self.h_tol = tk.IntVar(value=12)
         self.s_tol = tk.IntVar(value=60)
         self.v_tol = tk.IntVar(value=60)
+        self.scroll_rounds = tk.IntVar(value=5)
+        self.scroll_pause = tk.DoubleVar(value=0.8)
         self.save_debug = tk.BooleanVar(value=True)
         self.out_path = tk.StringVar(value=str(Path.cwd() / "wechat_export_gui.txt"))
         self.debug_dir = tk.StringVar(value=str(Path.cwd() / "debug_gui"))
         self.window_title = tk.StringVar(value="微信")
-        self.status = tk.StringVar(value="1) 截图或加载图片  2) 采样对方/自己颜色  3) 预览  4) 导出")
+        self.status = tk.StringVar(value="准备就绪")
+
+        # 交互增强变量
+        self.show_mask_var = tk.BooleanVar(value=False)
+        self.show_bubbles_var = tk.BooleanVar(value=False)
+        self.highlighter: tk.Toplevel | None = None
+
         self._build_layout()
 
     def run(self) -> None:
@@ -69,262 +86,342 @@ class OcrTunerGUI:
     def _pick_font_family(self) -> str:
         families = set(tkfont.families())
         for name in ("Source Han Sans CN", "Source Han Sans SC", "思源黑体", "Microsoft YaHei UI"):
-            if name in families:
-                return name
+            if name in families: return name
         return "TkDefaultFont"
-
-    def _create_round_button(self, parent, text: str, command, accent: bool = False, min_width: int = 128) -> tk.Canvas:
-        bg = "#2f80ff" if accent else "#e8f1ff"
-        fg = "#ffffff" if accent else "#1e4f9a"
-        border = "#2f80ff" if accent else "#9ec5ff"
-        font_obj = tkfont.Font(family=self.ui_font_family, size=11)
-        btn_w = max(min_width, font_obj.measure(text) + 44)
-        canvas = tk.Canvas(parent, width=btn_w, height=38, bg="#f5f9ff", highlightthickness=0, bd=0)
-        r = 10
-        x1, y1 = btn_w - 2, 36
-        points = [2 + r, 2, x1 - r, 2, x1, 2, x1, 2 + r, x1, y1 - r, x1, y1, x1 - r, y1, 2 + r, y1, 2, y1, 2, y1 - r, 2, 2 + r, 2, 2]
-        canvas.create_polygon(points, smooth=True, splinesteps=18, fill=bg, outline=border, width=1, tags="btn")
-        canvas.create_text(btn_w // 2, 19, text=text, fill=fg, font=(self.ui_font_family, 11), tags="txt")
-        canvas.bind("<Button-1>", lambda _: command())
-        canvas.bind("<Enter>", lambda _: canvas.itemconfig("btn", fill="#1f6feb" if accent else "#dcecff"))
-        canvas.bind("<Leave>", lambda _: canvas.itemconfig("btn", fill=bg))
-        canvas.configure(cursor="hand2")
-        return canvas
 
     def _build_layout(self) -> None:
         root_frame = ttk.Frame(self.root)
         root_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
-        root_frame.columnconfigure(0, weight=3)
-        root_frame.columnconfigure(1, weight=2)
-        root_frame.rowconfigure(0, weight=1)
-        left = ttk.Frame(root_frame)
-        right = ttk.Frame(root_frame)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        right.grid(row=0, column=1, sticky="nsew")
+        root_frame.columnconfigure(0, weight=4)
+        root_frame.columnconfigure(1, weight=1)
 
-        toolbar = ttk.Frame(left)
+        # --- 左侧区域 ---
+        left_side = ttk.Frame(root_frame)
+        left_side.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+
+        toolbar = ttk.Frame(left_side)
         toolbar.pack(fill=tk.X, pady=(0, 10))
-        self._create_round_button(toolbar, "框选截图", self.capture_region).pack(side=tk.LEFT, padx=4)
-        self._create_round_button(toolbar, "加载图片", self.load_image).pack(side=tk.LEFT, padx=4)
-        self._create_round_button(toolbar, "选取对方色", lambda: self.start_pick("other")).pack(side=tk.LEFT, padx=4)
-        self._create_round_button(toolbar, "选取自己色", lambda: self.start_pick("self")).pack(side=tk.LEFT, padx=4)
-        self._create_round_button(toolbar, "预览掩码/气泡框", self.preview_masks, min_width=220).pack(side=tk.LEFT, padx=4)
 
-        self.canvas = tk.Canvas(left, bg="#ffffff", highlightthickness=1, highlightbackground="#c9defa")
+        self._create_round_button(toolbar, "📷 框选截图", self.capture_region).pack(side=tk.LEFT, padx=4)
+        self._create_round_button(toolbar, "📂 加载图片", self.load_image).pack(side=tk.LEFT, padx=4)
+        self._create_round_button(toolbar, "🎯 采样对方颜色", lambda: self.start_pick("other")).pack(side=tk.LEFT,
+                                                                                                    padx=4)
+        self._create_round_button(toolbar, "🎯 采样自己颜色", lambda: self.start_pick("self")).pack(side=tk.LEFT, padx=4)
+
+        # 画布容器
+        canvas_container = ttk.Frame(left_side)
+        canvas_container.pack(fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(canvas_container, bg="#2c3e50", highlightthickness=1, highlightbackground="#b9d4f7")
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.bind("<Button-1>", self.on_canvas_click)
-        ttk.Label(left, textvariable=self.status, anchor="w").pack(fill=tk.X, pady=(8, 0))
 
-        lf_color = ttk.LabelFrame(right, text="颜色与容差")
-        lf_color.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(lf_color, text="对方HSV").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        self.lbl_other = tk.Label(lf_color, text="未采样（将使用默认颜色，可能影响识别效果）", fg="#d4380d", bg="#f5f9ff", font=(self.ui_font_family, 11))
-        self.lbl_other.grid(row=0, column=1, sticky="w", padx=6, pady=6)
-        ttk.Label(lf_color, text="自己HSV").grid(row=1, column=0, sticky="w", padx=6, pady=6)
-        self.lbl_self = tk.Label(lf_color, text="未采样（将使用默认颜色，可能影响识别效果）", fg="#d4380d", bg="#f5f9ff", font=(self.ui_font_family, 11))
-        self.lbl_self.grid(row=1, column=1, sticky="w", padx=6, pady=6)
-        ttk.Label(lf_color, text="H 容差").grid(row=2, column=0, sticky="w", padx=6, pady=4)
-        ttk.Scale(lf_color, from_=2, to=40, orient=tk.HORIZONTAL, variable=self.h_tol).grid(row=2, column=1, sticky="ew", padx=6)
-        ttk.Label(lf_color, text="S 容差").grid(row=3, column=0, sticky="w", padx=6, pady=4)
-        ttk.Scale(lf_color, from_=10, to=120, orient=tk.HORIZONTAL, variable=self.s_tol).grid(row=3, column=1, sticky="ew", padx=6)
-        ttk.Label(lf_color, text="V 容差").grid(row=4, column=0, sticky="w", padx=6, pady=4)
-        ttk.Scale(lf_color, from_=10, to=120, orient=tk.HORIZONTAL, variable=self.v_tol).grid(row=4, column=1, sticky="ew", padx=6)
-        lf_color.columnconfigure(1, weight=1)
+        ttk.Label(left_side, textvariable=self.status, foreground="#57606f",
+                  font=(self.ui_font_family, 10, "italic")).pack(fill=tk.X, pady=(5, 0))
 
-        lf_out = ttk.LabelFrame(right, text="输出设置")
-        lf_out.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(lf_out, text="微信窗口标题").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(lf_out, textvariable=self.window_title).grid(row=0, column=1, sticky="ew", padx=6, pady=6)
-        ttk.Label(lf_out, text="导出文件").grid(row=1, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(lf_out, textvariable=self.out_path).grid(row=1, column=1, sticky="ew", padx=6, pady=6)
-        ttk.Button(lf_out, text="选择", command=self.choose_out_path).grid(row=1, column=2, padx=6, pady=6)
-        self.save_debug_toggle = tk.Checkbutton(
-            lf_out, text="调试输出：开启", variable=self.save_debug, indicatoron=False, relief=tk.FLAT, bd=0,
-            bg="#2f80ff", fg="#ffffff", activebackground="#5a9dff", activeforeground="#ffffff",
-            selectcolor="#2f80ff", padx=12, pady=5, font=(self.ui_font_family, 11), command=self._on_debug_toggle,
-        )
-        self.save_debug_toggle.grid(row=2, column=0, sticky="w", padx=6, pady=6)
-        ttk.Label(lf_out, text="调试目录").grid(row=3, column=0, sticky="w", padx=6, pady=6)
-        ttk.Entry(lf_out, textvariable=self.debug_dir).grid(row=3, column=1, sticky="ew", padx=6, pady=6)
-        ttk.Button(lf_out, text="选择", command=self.choose_debug_dir).grid(row=3, column=2, padx=6, pady=6)
-        lf_out.columnconfigure(1, weight=1)
+        # --- 右侧控制面板 ---
+        right_side = ttk.Frame(root_frame)
+        right_side.grid(row=0, column=1, sticky="nsew")
 
-        lf_act = ttk.LabelFrame(right, text="执行")
-        lf_act.pack(fill=tk.X, pady=(0, 8))
-        self._create_round_button(lf_act, "执行 OCR 并导出", self.run_ocr_export, accent=False, min_width=260).pack(fill=tk.X, padx=8, pady=8)
-        ttk.Label(right, text="建议：\n1. 先框选截图\n2. 采样对方和自己气泡\n3. 预览\n4. 导出", justify=tk.LEFT).pack(fill=tk.X)
+        # 1. 实时预览控制
+        lf_preview = ttk.LabelFrame(right_side, text="🔍 实时视觉预览")
+        lf_preview.pack(fill=tk.X, pady=(0, 10))
 
-    def _on_debug_toggle(self) -> None:
-        enabled = bool(self.save_debug.get())
-        self.save_debug_toggle.configure(
-            text=f"调试输出：{'开启' if enabled else '关闭'}",
-            bg="#2f80ff" if enabled else "#9eb5d2",
-            activebackground="#5a9dff" if enabled else "#b4c7dd",
-            selectcolor="#2f80ff" if enabled else "#9eb5d2",
-        )
+        tk.Checkbutton(lf_preview, text="显示颜色掩码 (Mask)", variable=self.show_mask_var,
+                       command=self.refresh_preview, bg=self.bg_color).pack(anchor="w", padx=10, pady=2)
+        tk.Checkbutton(lf_preview, text="显示识别气泡框 (Bubbles)", variable=self.show_bubbles_var,
+                       command=self.refresh_preview, bg=self.bg_color).pack(anchor="w", padx=10, pady=2)
+        ttk.Button(lf_preview, text="强制刷新视图", command=self.refresh_preview).pack(fill=tk.X, padx=10, pady=5)
 
-    def _reset_sample_state(self) -> None:
-        self.other_hsv = None
-        self.self_hsv = None
-        hint = "未采样（将使用默认颜色，可能影响识别效果）"
-        self.lbl_other.configure(text=hint, fg="#d4380d")
-        self.lbl_self.configure(text=hint, fg="#d4380d")
+        # 2. 颜色与容差
+        lf_color = ttk.LabelFrame(right_side, text="🎨 采样容差调整")
+        lf_color.pack(fill=tk.X, pady=(0, 10))
 
-    def _current_color_config(self) -> dict[str, Any] | None:
-        if not self.other_hsv or not self.self_hsv:
-            return None
-        return {"other_hsv": list(self.other_hsv), "self_hsv": list(self.self_hsv), "h_tol": int(self.h_tol.get()), "s_tol": int(self.s_tol.get()), "v_tol": int(self.v_tol.get())}
+        f_other = ttk.Frame(lf_color)
+        f_other.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(f_other, text="对方:").pack(side=tk.LEFT)
+        self.lbl_other = tk.Label(f_other, text="[未采样]", fg="#d4380d", bg=self.bg_color)
+        self.lbl_other.pack(side=tk.LEFT, padx=5)
 
-    def choose_out_path(self) -> None:
-        p = filedialog.asksaveasfilename(title="选择导出文件", defaultextension=".txt", filetypes=[("Text", "*.txt"), ("JSON", "*.json")])
-        if p:
-            self.out_path.set(p)
+        f_self = ttk.Frame(lf_color)
+        f_self.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(f_self, text="自己:").pack(side=tk.LEFT)
+        self.lbl_self = tk.Label(f_self, text="[未采样]", fg="#d4380d", bg=self.bg_color)
+        self.lbl_self.pack(side=tk.LEFT, padx=5)
 
-    def choose_debug_dir(self) -> None:
-        p = filedialog.askdirectory(title="选择调试输出目录")
-        if p:
-            self.debug_dir.set(p)
+        self._add_slider(lf_color, "H 容差", self.h_tol, 2, 40)
+        self._add_slider(lf_color, "S 容差", self.s_tol, 10, 150)
+        self._add_slider(lf_color, "V 容差", self.v_tol, 10, 150)
 
-    def capture_region(self) -> None:
-        title = self.window_title.get().strip() or "微信"
-        # 将 get_wechat_window 移到这里，且不应因找不到窗口而中断流程
-        win = get_wechat_window(title)
+        # 3. 滚动与输出
+        lf_setup = ttk.LabelFrame(right_side, text="⚙️ 滚动与导出设置")
+        lf_setup.pack(fill=tk.X, pady=(0, 10))
 
-        if win is None:
-            # 如果没找到，只是给个提示，不直接 return
-            self.status.set(f"提示：未找到标题包含「{title}」的窗口，请手动框选任意区域。")
+        self._add_entry(lf_setup, "窗口标题:", self.window_title)
+        self._add_entry(lf_setup, "滚动屏数:", self.scroll_rounds, is_spin=True, _from=2, _to=100)
+        self._add_entry(lf_setup, "滚动间隔:", self.scroll_pause, is_spin=True, _from=0.2, _to=5.0)
+
+        ttk.Separator(lf_setup, orient="horizontal").pack(fill=tk.X, pady=8, padx=10)
+
+        self._add_path_box(lf_setup, "导出文件:", self.out_path, self.choose_out_path)
+        self._add_path_box(lf_setup, "调试目录:", self.debug_dir, self.choose_debug_dir)
+
+        tk.Checkbutton(lf_setup, text="保存调试截图 (Debug Mode)", variable=self.save_debug, bg=self.bg_color).pack(
+            anchor="w", padx=10)
+
+        # 4. 执行按钮
+        lf_run = ttk.LabelFrame(right_side, text="🚀 开始执行")
+        lf_run.pack(fill=tk.X, pady=(0, 10))
+
+        self._create_round_button(lf_run, "单页导出", self.run_ocr_export, min_width=280).pack(pady=5, padx=10)
+        self._create_round_button(lf_run, "自动滚动导出", self.run_scroll_ocr_export, accent=True, min_width=280).pack(
+            pady=5, padx=10)
+
+    def _add_slider(self, parent, label, var, f, t):
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X, padx=10, pady=2)
+        ttk.Label(frame, text=label, width=8).pack(side=tk.LEFT)
+        scale = ttk.Scale(frame, from_=f, to=t, variable=var, orient=tk.HORIZONTAL,
+                          command=lambda _: self.refresh_preview())
+        scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Label(frame, textvariable=var, width=3).pack(side=tk.LEFT)
+
+    def _add_entry(self, parent, label, var, is_spin=False, _from=0, _to=0):
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X, padx=10, pady=4)
+        ttk.Label(frame, text=label, width=10).pack(side=tk.LEFT)
+        if is_spin:
+            ttk.Spinbox(frame, from_=_from, to=_to, textvariable=var, width=10).pack(side=tk.LEFT)
         else:
-            self.status.set(f"已激活窗口「{title}」，请开始框选聊天区域。")
+            ttk.Entry(frame, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # 隐藏 GUI 准备截图
-        self.root.withdraw()
-        self.root.update_idletasks()
-        time.sleep(0.3)  # 给窗口切换留出时间
+    def _add_path_box(self, parent, label, var, cmd):
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X, padx=10, pady=4)
+        ttk.Label(frame, text=label).pack(anchor="w")
+        entry_f = ttk.Frame(frame)
+        entry_f.pack(fill=tk.X)
+        ttk.Entry(entry_f, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(entry_f, text="...", width=3, command=cmd).pack(side=tk.LEFT, padx=2)
 
-        # 进入交互式框选
-        region = select_region_interactive()
+    def _create_round_button(self, parent, text: str, command, accent: bool = False, min_width: int = 140) -> tk.Canvas:
+        bg = "#2f80ff" if accent else "#ffffff"
+        fg = "#ffffff" if accent else "#2f80ff"
+        border = "#2f80ff"
+        font_obj = tkfont.Font(family=self.ui_font_family, size=11, weight="bold")
+        btn_w = max(min_width, font_obj.measure(text) + 40)
 
-        if not region:
-            self.root.deiconify()
-            self.status.set("已取消框选。")
-            return
+        # 修复点：直接使用 self.bg_color 而不是尝试从 parent 读取
+        canvas = tk.Canvas(parent, width=btn_w, height=42, bg=self.bg_color, highlightthickness=0, bd=0)
 
-        # 截图并恢复 GUI
-        shot = pyautogui.screenshot(region=region)
-        self.root.deiconify()
-        self.root.lift()
-        self.root.focus_force()
+        def draw_shape(color):
+            canvas.delete("btn")
+            r = 12
+            x1, y1 = btn_w - 2, 40
+            points = [2 + r, 2, x1 - r, 2, x1, 2, x1, 2 + r, x1, y1 - r, x1, y1, x1 - r, y1, 2 + r, y1, 2, y1, 2,
+                      y1 - r, 2, 2 + r, 2, 2]
+            canvas.create_polygon(points, smooth=True, splinesteps=20, fill=color, outline=border, width=1.5,
+                                  tags="btn")
+            canvas.create_text(btn_w // 2, 21, text=text, fill=fg, font=font_obj, tags="txt")
 
-        # 处理图片
-        self.base_img = cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
-        self._reset_sample_state()
-        self._show_image(self.base_img)
-        self.status.set(f"截图成功：{region}。接下来请采样颜色或直接预览。")
-    def load_image(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("Image files", "*.png;*.jpg;*.jpeg;*.bmp")])
-        if not path:
-            return
-        img = cv2.imread(path)
-        if img is None:
-            messagebox.showerror("错误", "图片读取失败")
-            return
-        self.base_img = img
-        self._reset_sample_state()
-        self._show_image(self.base_img)
-        self.status.set(f"已加载：{path}")
+        draw_shape(bg)
+        canvas.bind("<Button-1>", lambda _: command())
+        canvas.bind("<Enter>", lambda _: draw_shape("#1e69de" if accent else "#f0f7ff"))
+        canvas.bind("<Leave>", lambda _: draw_shape(bg))
+        canvas.configure(cursor="hand2")
+        return canvas
 
-    def start_pick(self, target: str) -> None:
-        if self.base_img is None:
-            messagebox.showinfo("提示", "请先截图或加载图片")
-            return
-        self.pick_target = target
-        self.status.set("请在预览图上单击采样颜色")
+    def refresh_preview(self, *args):
+        if self.base_img is None: return
+        vis = self.base_img.copy()
+        color_config = self._current_color_config()
+
+        if self.show_mask_var.get() and color_config:
+            white_mask, green_mask = _build_color_masks(vis, color_config=color_config)
+            mask_overlay = np.zeros_like(vis)
+            mask_overlay[white_mask > 0] = [255, 200, 200]
+            mask_overlay[green_mask > 0] = [200, 255, 200]
+            vis = cv2.addWeighted(vis, 0.6, mask_overlay, 0.4, 0)
+
+        if self.show_bubbles_var.get():
+            cfg = color_config if color_config else None
+            white_m, green_m = _build_color_masks(self.base_img, color_config=cfg)
+            h, w = self.base_img.shape[:2]
+            bubbles = _extract_bubbles_from_mask(white_m, "对方", w, h) + _extract_bubbles_from_mask(green_m, "自己", w,
+                                                                                                     h)
+            for b in bubbles:
+                x0, y0, x1, y1 = b["bbox"]
+                color = (255, 50, 50) if b["sender"] == "对方" else (50, 200, 50)
+                cv2.rectangle(vis, (x0, y0), (x1, y1), color, 2)
+                cv2.putText(vis, b["sender"], (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        self._show_image(vis)
 
     def on_canvas_click(self, e: tk.Event) -> None:
-        if self.base_img is None or not self.pick_target:
-            return
+        if self.base_img is None or not self.pick_target: return
         ox, oy = self.view_offset
         x = int((e.x - ox) / self.scale_ratio)
         y = int((e.y - oy) / self.scale_ratio)
         h, w = self.base_img.shape[:2]
-        if x < 0 or y < 0 or x >= w or y >= h:
-            return
-        bgr = self.base_img[y, x]
-        hsv = cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0][0]
-        hsv_tuple = (int(hsv[0]), int(hsv[1]), int(hsv[2]))
-        if self.pick_target == "other":
-            self.other_hsv = hsv_tuple
-            self.lbl_other.configure(text=str(hsv_tuple), fg="#389e0d")
-            self.status.set(f"已采样对方颜色：{hsv_tuple}")
-        else:
-            self.self_hsv = hsv_tuple
-            self.lbl_self.configure(text=str(hsv_tuple), fg="#389e0d")
-            self.status.set(f"已采样自己颜色：{hsv_tuple}")
-        self.pick_target = None
+        if 0 <= x < w and 0 <= y < h:
+            bgr = self.base_img[y, x]
+            hsv = cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0][0]
+            hsv_t = (int(hsv[0]), int(hsv[1]), int(hsv[2]))
+            if self.pick_target == "other":
+                self.other_hsv = hsv_t
+                self.lbl_other.configure(text=f"HSV{hsv_t}", fg="#389e0d")
+            else:
+                self.self_hsv = hsv_t
+                self.lbl_self.configure(text=f"HSV{hsv_t}", fg="#389e0d")
+            self.pick_target = None
+            self.status.set(f"采样成功: {hsv_t}")
+            self.refresh_preview()
 
-    def preview_masks(self) -> None:
-        if self.base_img is None:
-            messagebox.showinfo("提示", "请先截图或加载图片")
-            return
-        color_config = self._current_color_config()
-        white_mask, green_mask = _build_color_masks(self.base_img, color_config=color_config)
-        h, w = self.base_img.shape[:2]
-        bubbles = _extract_bubbles_from_mask(white_mask, "对方", w, h) + _extract_bubbles_from_mask(green_mask, "自己", w, h)
-        vis = self.base_img.copy()
-        for b in bubbles:
-            x0, y0, x1, y1 = b["bbox"]
-            color = (255, 0, 0) if b["sender"] == "对方" else (0, 180, 0)
-            cv2.rectangle(vis, (x0, y0), (x1, y1), color, 2)
-        self._show_image(vis)
-        other_cnt = len([b for b in bubbles if b["sender"] == "对方"])
-        mode_text = "默认阈值" if not color_config else "采样阈值"
-        self.status.set(f"预览完成（{mode_text}）：对方{other_cnt}条，自己{len(bubbles) - other_cnt}条")
+    def show_scroll_highlighter(self, region):
+        if self.highlighter: self.highlighter.destroy()
+        x, y, w, h = region
+        self.highlighter = tk.Toplevel()
+        self.highlighter.overrideredirect(True)
+        self.highlighter.attributes("-topmost", True)
+        self.highlighter.attributes("-transparentcolor", "#000001")
+        self.highlighter.geometry(f"{w + 10}x{h + 10}+{x - 5}+{y - 5}")
+        canvas = tk.Canvas(self.highlighter, width=w + 10, height=h + 10, bg="#000001", highlightthickness=0)
+        canvas.pack()
+        canvas.create_rectangle(5, 5, w + 5, h + 5, outline="red", width=4, dash=(10, 5))
+        canvas.create_text(w // 2, h // 2, text="⚠️ 自动识别中，请勿操作鼠标!", fill="red",
+                           font=(self.ui_font_family, 14, "bold"))
+        self.root.update()
 
-    def run_ocr_export(self) -> None:
-        if self.base_img is None:
-            messagebox.showinfo("提示", "请先截图或加载图片")
+    def run_scroll_ocr_export(self) -> None:
+        if self.selected_region is None:
+            messagebox.showinfo("提示", "请先点击“框选截图”确定采集区域")
             return
-        color_config = self._current_color_config()
-        out = self.out_path.get().strip()
-        if not out:
-            messagebox.showinfo("提示", "请先设置导出文件路径")
+        out = self._validate_out_path()
+        if not out: return
+        rounds = self.scroll_rounds.get()
+        pause = self.scroll_pause.get()
+        title = self.window_title.get().strip() or "微信"
+        win = get_wechat_window(title)
+        if win is None:
+            messagebox.showerror("错误", f"未找到窗口: {title}")
             return
-        dbg = self.debug_dir.get().strip() if self.save_debug.get() else None
-        Path(out).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-        if dbg:
-            Path(dbg).mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(suffix=".png")
-        os.close(fd)
+        msg = f"即将开始自动滚动识别。\n请停止操作鼠标！"
+        if not messagebox.askokcancel("确认自动滚动", msg): return
+        self.show_scroll_highlighter(self.selected_region)
+
+        def update_progress(curr, total):
+            self.status.set(f"🚀 进度: 第 {curr}/{total} 屏识别中...")
+            self.root.update()
+
         try:
-            cv2.imwrite(tmp_path, self.base_img)
-            rows = _run_ocr_on_file(tmp_path, debug_dir=dbg, color_config=color_config)
+            color_cfg = self._current_color_config()
+            dbg = self._prepare_debug_dir()
+            frames = scroll_and_collect(win, rounds=rounds, pause=pause, region=self.selected_region,
+                                        debug_dir=dbg, color_config=color_cfg, progress_callback=update_progress)
+            merged = merge_scrolled_frames(frames)
+            self._export_frames(frames, out, {"mode": "gui_scroll"})
+            messagebox.showinfo("完成", f"滚动导出成功！\n采集: {len(frames)} 屏\n总计: {len(merged)} 条消息")
         finally:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-        frames = [rows]
-        meta = {"generated_utc": datetime.now(timezone.utc).isoformat(), "mode": "gui", "color_config": color_config if color_config else {"mode": "default_threshold"}}
-        if out.lower().endswith(".json"):
-            export_json(frames, out, meta)
-        else:
-            export_txt(frames, out, meta)
-        mode_text = "默认阈值" if not color_config else "采样阈值"
-        self.status.set(f"导出完成（{mode_text}）：{out}（共{len(rows)}条）")
-        messagebox.showinfo("完成", f"导出成功\n路径: {out}\n有效消息: {len(rows)}\n颜色模式: {mode_text}")
+            if self.highlighter: self.highlighter.destroy()
+            self.highlighter = None
 
     def _show_image(self, img_bgr: np.ndarray) -> None:
+        self.root.update_idletasks()
         cw = max(200, self.canvas.winfo_width())
         ch = max(200, self.canvas.winfo_height())
         h, w = img_bgr.shape[:2]
-        ratio = max(0.1, min(cw / w, ch / h))
+        ratio = min(cw / w, ch / h) * 0.95
         nw, nh = int(w * ratio), int(h * ratio)
         resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         self.preview_imgtk = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.canvas.delete("all")
-        ox = (cw - nw) // 2
-        oy = (ch - nh) // 2
+        ox, oy = (cw - nw) // 2, (ch - nh) // 2
         self.canvas.create_image(ox, oy, image=self.preview_imgtk, anchor=tk.NW)
-        self.scale_ratio = ratio
-        self.view_offset = (ox, oy)
+        self.scale_ratio, self.view_offset = ratio, (ox, oy)
+
+    def capture_region(self) -> None:
+        title = self.window_title.get().strip() or "微信"
+        win = get_wechat_window(title)
+        self.root.withdraw()
+        try:
+            # Let desktop/window compositor settle after hiding GUI.
+            time.sleep(0.25)
+            region = select_region_interactive()
+            if region:
+                self.selected_region = region
+                # Keep GUI hidden while taking screenshot to avoid overlay artifacts.
+                time.sleep(0.12)
+                shot = pyautogui.screenshot(region=region)
+                self.base_img = cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
+                self.refresh_preview()
+        finally:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+
+    def load_image(self) -> None:
+        path = filedialog.askopenfilename()
+        if path:
+            img = cv2.imread(path)
+            if img is not None:
+                self.base_img = img
+                self.selected_region = None
+                self.refresh_preview()
+
+    def start_pick(self, target: str) -> None:
+        if self.base_img is None: return
+        self.pick_target = target
+        self.status.set(f"正在采样【{'对方' if target == 'other' else '自己'}】颜色，请点击预览图...")
+
+    def run_ocr_export(self) -> None:
+        if self.base_img is None: return
+        out = self._validate_out_path()
+        if not out: return
+        color_cfg = self._current_color_config()
+        dbg = self._prepare_debug_dir()
+        fd, tmp = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            cv2.imwrite(tmp, self.base_img)
+            rows = _run_ocr_on_file(tmp, debug_dir=dbg, color_config=color_cfg)
+            self._export_frames([rows], out, {"mode": "single"})
+            messagebox.showinfo("成功", f"单页导出完成。")
+        finally:
+            if os.path.exists(tmp): os.remove(tmp)
+
+    def choose_out_path(self):
+        p = filedialog.asksaveasfilename(defaultextension=".txt")
+        if p: self.out_path.set(p)
+
+    def choose_debug_dir(self):
+        p = filedialog.askdirectory()
+        if p: self.debug_dir.set(p)
+
+    def _validate_out_path(self):
+        p = self.out_path.get().strip()
+        if not p: return None
+        Path(p).parent.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def _prepare_debug_dir(self):
+        if not self.save_debug.get(): return None
+        d = self.debug_dir.get().strip()
+        if d: Path(d).mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _current_color_config(self):
+        if not self.other_hsv or not self.self_hsv: return None
+        return {
+            "other_hsv": list(self.other_hsv), "self_hsv": list(self.self_hsv),
+            "h_tol": self.h_tol.get(), "s_tol": self.s_tol.get(), "v_tol": self.v_tol.get()
+        }
+
+    def _export_frames(self, frames, out, meta):
+        if out.lower().endswith(".json"):
+            export_json(frames, out, meta)
+        else:
+            export_txt(frames, out, meta)
+
+
+if __name__ == "__main__":
+    app = OcrTunerGUI()
+    app.run()

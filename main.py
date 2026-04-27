@@ -9,6 +9,7 @@ from ocr_core import (
     export_json,
     export_txt,
     get_wechat_window,
+    merge_scrolled_frames,
     ocr_chat_region,
     scroll_and_collect,
     select_region_interactive,
@@ -93,7 +94,7 @@ def main() -> None:
     else:
         export_txt(frames, out, meta)
 
-    total = sum(len(frame) for frame in frames)
+    total = len(merge_scrolled_frames(frames))
     print(f"\n导出完成：共 {len(frames)} 屏，{total} 条有效聊天记录。")
     print(f"文件路径: {out}")
 
