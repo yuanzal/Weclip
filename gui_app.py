@@ -24,6 +24,7 @@ from ocr_core import (
     get_wechat_window,
     merge_scrolled_frames,
     scroll_and_collect,
+    scroll_and_collect_stitched,
     select_region_interactive,
 )
 
@@ -32,8 +33,12 @@ class OcrTunerGUI:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title("WeChat OCR 专家级调参工具")
-        self.root.geometry("1500x950")
-        self.root.minsize(1350, 850)
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        init_w = max(1360, min(1920, int(sw * 0.86)))
+        init_h = max(860, min(1180, int(sh * 0.88)))
+        self.root.geometry(f"{init_w}x{init_h}")
+        self.root.minsize(1260, 800)
 
         # 定义全局统一背景色
         self.bg_color = "#f5f9ff"
@@ -92,8 +97,9 @@ class OcrTunerGUI:
     def _build_layout(self) -> None:
         root_frame = ttk.Frame(self.root)
         root_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
-        root_frame.columnconfigure(0, weight=4)
-        root_frame.columnconfigure(1, weight=1)
+        root_frame.rowconfigure(0, weight=1)
+        root_frame.columnconfigure(0, weight=3)
+        root_frame.columnconfigure(1, weight=2, minsize=410)
 
         # --- 左侧区域 ---
         left_side = ttk.Frame(root_frame)
@@ -121,9 +127,35 @@ class OcrTunerGUI:
         # --- 右侧控制面板 ---
         right_side = ttk.Frame(root_frame)
         right_side.grid(row=0, column=1, sticky="nsew")
+        controls_container = ttk.Frame(right_side)
+        controls_container.pack(fill=tk.BOTH, expand=True)
+
+        right_canvas = tk.Canvas(controls_container, bg=self.bg_color, highlightthickness=0, bd=0)
+        right_scroll = ttk.Scrollbar(controls_container, orient="vertical", command=right_canvas.yview)
+        right_canvas.configure(yscrollcommand=right_scroll.set)
+        right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        controls = ttk.Frame(right_canvas)
+        controls_win = right_canvas.create_window((0, 0), window=controls, anchor="nw")
+
+        def _on_controls_configure(_: tk.Event) -> None:
+            right_canvas.configure(scrollregion=right_canvas.bbox("all"))
+
+        def _on_canvas_configure(e: tk.Event) -> None:
+            right_canvas.itemconfigure(controls_win, width=e.width)
+
+        controls.bind("<Configure>", _on_controls_configure)
+        right_canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(e: tk.Event) -> None:
+            right_canvas.yview_scroll(int(-e.delta / 120), "units")
+
+        right_canvas.bind("<Enter>", lambda _: right_canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        right_canvas.bind("<Leave>", lambda _: right_canvas.unbind_all("<MouseWheel>"))
 
         # 1. 实时预览控制
-        lf_preview = ttk.LabelFrame(right_side, text="🔍 实时视觉预览")
+        lf_preview = ttk.LabelFrame(controls, text="🔍 实时视觉预览")
         lf_preview.pack(fill=tk.X, pady=(0, 10))
 
         tk.Checkbutton(lf_preview, text="显示颜色掩码 (Mask)", variable=self.show_mask_var,
@@ -133,7 +165,7 @@ class OcrTunerGUI:
         ttk.Button(lf_preview, text="强制刷新视图", command=self.refresh_preview).pack(fill=tk.X, padx=10, pady=5)
 
         # 2. 颜色与容差
-        lf_color = ttk.LabelFrame(right_side, text="🎨 采样容差调整")
+        lf_color = ttk.LabelFrame(controls, text="🎨 采样容差调整")
         lf_color.pack(fill=tk.X, pady=(0, 10))
 
         f_other = ttk.Frame(lf_color)
@@ -153,7 +185,7 @@ class OcrTunerGUI:
         self._add_slider(lf_color, "V 容差", self.v_tol, 10, 150)
 
         # 3. 滚动与输出
-        lf_setup = ttk.LabelFrame(right_side, text="⚙️ 滚动与导出设置")
+        lf_setup = ttk.LabelFrame(controls, text="⚙️ 滚动与导出设置")
         lf_setup.pack(fill=tk.X, pady=(0, 10))
 
         self._add_entry(lf_setup, "窗口标题:", self.window_title)
@@ -169,7 +201,7 @@ class OcrTunerGUI:
             anchor="w", padx=10)
 
         # 4. 执行按钮
-        lf_run = ttk.LabelFrame(right_side, text="🚀 开始执行")
+        lf_run = ttk.LabelFrame(controls, text="🚀 开始执行")
         lf_run.pack(fill=tk.X, pady=(0, 10))
 
         self._create_round_button(lf_run, "单页导出", self.run_ocr_export, min_width=280).pack(pady=5, padx=10)
@@ -276,52 +308,70 @@ class OcrTunerGUI:
             self.refresh_preview()
 
     def show_scroll_highlighter(self, region):
-        if self.highlighter: self.highlighter.destroy()
+        if self.highlighter:
+            self.highlighter.destroy()
         x, y, w, h = region
         self.highlighter = tk.Toplevel()
         self.highlighter.overrideredirect(True)
         self.highlighter.attributes("-topmost", True)
         self.highlighter.attributes("-transparentcolor", "#000001")
-        self.highlighter.geometry(f"{w + 10}x{h + 10}+{x - 5}+{y - 5}")
-        canvas = tk.Canvas(self.highlighter, width=w + 10, height=h + 10, bg="#000001", highlightthickness=0)
+        self.highlighter.geometry(f"{w + 14}x{h + 14}+{x - 7}+{y - 7}")
+        canvas = tk.Canvas(self.highlighter, width=w + 14, height=h + 14, bg="#000001", highlightthickness=0)
         canvas.pack()
-        canvas.create_rectangle(5, 5, w + 5, h + 5, outline="red", width=4, dash=(10, 5))
-        canvas.create_text(w // 2, h // 2, text="⚠️ 自动识别中，请勿操作鼠标!", fill="red",
-                           font=(self.ui_font_family, 14, "bold"))
+        canvas.create_rectangle(2, 2, w + 12, h + 12, outline="red", width=3, dash=(10, 5))
         self.root.update()
 
     def run_scroll_ocr_export(self) -> None:
         if self.selected_region is None:
-            messagebox.showinfo("提示", "请先点击“框选截图”确定采集区域")
+            messagebox.showinfo("提示", "请先点击“框选截图”确定采集区域。")
             return
+
         out = self._validate_out_path()
-        if not out: return
+        if not out:
+            return
+
         rounds = self.scroll_rounds.get()
         pause = self.scroll_pause.get()
-        title = self.window_title.get().strip() or "微信"
+        title = self.window_title.get().strip() or "WeChat"
         win = get_wechat_window(title)
         if win is None:
-            messagebox.showerror("错误", f"未找到窗口: {title}")
+            messagebox.showerror("错误", f"未找到窗口：{title}")
             return
-        msg = f"即将开始自动滚动识别。\n请停止操作鼠标！"
-        if not messagebox.askokcancel("确认自动滚动", msg): return
+
+        msg = "即将开始自动滚动识别。\n请不要移动鼠标。"
+        if not messagebox.askokcancel("确认", msg):
+            return
+
+        self.root.withdraw()
         self.show_scroll_highlighter(self.selected_region)
+        self.status.set("Auto OCR starting...")
 
         def update_progress(curr, total):
-            self.status.set(f"🚀 进度: 第 {curr}/{total} 屏识别中...")
+            self.status.set(f"Progress: {curr}/{total} capturing...")
             self.root.update()
 
         try:
             color_cfg = self._current_color_config()
             dbg = self._prepare_debug_dir()
-            frames = scroll_and_collect(win, rounds=rounds, pause=pause, region=self.selected_region,
-                                        debug_dir=dbg, color_config=color_cfg, progress_callback=update_progress)
-            merged = merge_scrolled_frames(frames)
-            self._export_frames(frames, out, {"mode": "gui_scroll"})
-            messagebox.showinfo("完成", f"滚动导出成功！\n采集: {len(frames)} 屏\n总计: {len(merged)} 条消息")
+            rows, captured_frames = scroll_and_collect_stitched(
+                win,
+                rounds=rounds,
+                pause=pause,
+                region=self.selected_region,
+                debug_dir=dbg,
+                color_config=color_cfg,
+                progress_callback=update_progress,
+            )
+            self._export_frames([rows], out, {"mode": "gui_scroll_stitched"})
+            self.status.set(f"滚动识别完成：采集 {captured_frames} 屏，识别 {len(rows)} 条消息")
+            messagebox.showinfo("完成", f"导出完成\n采集屏数：{captured_frames}\n消息总数：{len(rows)}")
         finally:
-            if self.highlighter: self.highlighter.destroy()
+            if self.highlighter:
+                self.highlighter.destroy()
             self.highlighter = None
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
 
     def _show_image(self, img_bgr: np.ndarray) -> None:
         self.root.update_idletasks()

@@ -360,6 +360,249 @@ def _frame_fingerprint(rows: list[dict[str, Any]]) -> str:
     return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _capture_region_bgr(region: tuple[int, int, int, int]) -> np.ndarray:
+    shot = pyautogui.screenshot(region=region)
+    return cv2.cvtColor(np.array(shot), cv2.COLOR_RGB2BGR)
+
+
+def _run_ocr_on_bgr(
+    img_bgr: np.ndarray,
+    debug_dir: str | None = None,
+    color_config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    fd, tmp_path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        cv2.imwrite(tmp_path, img_bgr)
+        return _run_ocr_on_file(tmp_path, debug_dir=debug_dir, color_config=color_config)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _estimate_vertical_shift(prev_bgr: np.ndarray, curr_bgr: np.ndarray) -> float:
+    if prev_bgr.shape != curr_bgr.shape:
+        return 9999.0
+
+    h, w = prev_bgr.shape[:2]
+    x0, x1 = int(w * 0.1), int(w * 0.9)
+    y0, y1 = int(h * 0.15), int(h * 0.85)
+    if x1 <= x0 or y1 <= y0:
+        return 9999.0
+
+    prev_gray = cv2.cvtColor(prev_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    curr_gray = cv2.cvtColor(curr_bgr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    (dx, dy), response = cv2.phaseCorrelate(prev_gray, curr_gray)
+    dy_abs = abs(float(dy))
+
+    if np.isnan(dy_abs):
+        return 0.0
+
+    # Low confidence phase correlation falls back to average pixel delta.
+    if response < 0.02:
+        prev_u8 = prev_gray.astype(np.uint8)
+        curr_u8 = curr_gray.astype(np.uint8)
+        mean_diff = float(np.mean(cv2.absdiff(prev_u8, curr_u8)))
+        if mean_diff >= 2.0:
+            return 9999.0
+        return 0.0
+
+    return dy_abs
+
+
+def _best_vertical_overlap(prev_bgr: np.ndarray, curr_bgr: np.ndarray) -> tuple[str, int, float]:
+    h, w = prev_bgr.shape[:2]
+    if curr_bgr.shape[:2] != (h, w):
+        return ("append_bottom", 0, 9999.0)
+    if h < 40 or w < 40:
+        return ("append_bottom", 0, 9999.0)
+
+    prev_gray = cv2.cvtColor(prev_bgr, cv2.COLOR_BGR2GRAY)
+    curr_gray = cv2.cvtColor(curr_bgr, cv2.COLOR_BGR2GRAY)
+
+    target_w = min(360, w)
+    scale = target_w / float(w)
+    target_h = max(1, int(h * scale))
+    prev_small = cv2.resize(prev_gray, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    curr_small = cv2.resize(curr_gray, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+    min_ov = max(12, int(target_h * 0.2))
+    max_ov = max(min_ov, int(target_h * 0.92))
+    step = 4
+
+    best_mode = "append_bottom"
+    best_ov = 0
+    best_score = 9999.0
+
+    for ov in range(max_ov, min_ov - 1, -step):
+        a1 = prev_small[-ov:, :]
+        b1 = curr_small[:ov, :]
+        score1 = float(np.mean(cv2.absdiff(a1, b1)))
+        if score1 < best_score:
+            best_score = score1
+            best_mode = "append_bottom"
+            best_ov = ov
+
+        a2 = prev_small[:ov, :]
+        b2 = curr_small[-ov:, :]
+        score2 = float(np.mean(cv2.absdiff(a2, b2)))
+        if score2 < best_score:
+            best_score = score2
+            best_mode = "prepend_top"
+            best_ov = ov
+
+    if best_score > 26.0:
+        return ("append_bottom", 0, best_score)
+
+    ov_full = int(best_ov / scale) if scale > 0 else 0
+    ov_full = max(0, min(ov_full, h - 1))
+    return (best_mode, ov_full, best_score)
+
+
+def stitch_scrolled_captures(captures: list[np.ndarray]) -> np.ndarray:
+    if not captures:
+        raise ValueError("captures is empty")
+    if len(captures) == 1:
+        return captures[0].copy()
+
+    stitched = captures[0].copy()
+    for curr in captures[1:]:
+        mode, overlap, _ = _best_vertical_overlap(stitched[-curr.shape[0]:, :], curr)
+        if mode == "append_bottom":
+            if overlap > 0:
+                stitched = np.vstack([stitched, curr[overlap:, :]])
+            else:
+                stitched = np.vstack([stitched, curr])
+        else:
+            if overlap > 0:
+                stitched = np.vstack([curr[:-overlap, :], stitched])
+            else:
+                stitched = np.vstack([curr, stitched])
+    return stitched
+
+
+def scroll_capture_images(
+    window,
+    rounds: int,
+    pause: float,
+    region: tuple[int, int, int, int] | None = None,
+    progress_callback=None,
+) -> list[np.ndarray]:
+    if region is None:
+        region = _chat_region(window)
+
+    cx = region[0] + region[2] // 2
+    cy = region[1] + region[3] // 2
+    target_shift_px = max(1.0, float(region[3]))
+
+    pyautogui.click(cx, cy)
+    time.sleep(0.3)
+
+    captures: list[np.ndarray] = []
+    next_capture: np.ndarray | None = None
+
+    def _scroll_to_target(
+        start_img: np.ndarray,
+        target_shift: float,
+    ) -> tuple[bool, np.ndarray, float]:
+        img_prev = start_img
+        img_last = start_img
+        moved_px = 0.0
+        no_move_streak = 0
+
+        # Wheel unit is not pixel-based, so use feedback loop to tune step size.
+        step_units = max(60, int(region[3] / 8))
+        min_step_units = 30
+        max_step_units = max(360, int(region[3] * 2))
+        max_scroll_attempts = 12
+
+        pyautogui.moveTo(cx, cy)
+        for _ in range(max_scroll_attempts):
+            if moved_px >= target_shift:
+                break
+
+            pyautogui.scroll(step_units)
+            time.sleep(max(0.02, pause / 8))
+            img_now = _capture_region_bgr(region)
+            img_last = img_now
+            shift_y = _estimate_vertical_shift(img_prev, img_now)
+
+            if shift_y < 1.5:
+                no_move_streak += 1
+                step_units = min(max_step_units, int(step_units * 1.6))
+                if no_move_streak >= 2:
+                    break
+                continue
+
+            no_move_streak = 0
+            moved_px += shift_y
+            remaining = target_shift - moved_px
+            if remaining <= 0:
+                img_prev = img_now
+                break
+
+            gain = shift_y / max(step_units, 1)
+            desired = int(remaining / max(gain, 0.05))
+            step_units = max(min_step_units, min(max_step_units, desired))
+            img_prev = img_now
+
+        return (moved_px >= 3.0), img_last, moved_px
+
+    for i in range(rounds):
+        if progress_callback:
+            progress_callback(i + 1, rounds)
+
+        curr_capture = next_capture if next_capture is not None else _capture_region_bgr(region)
+        captures.append(curr_capture)
+        if i >= rounds - 1:
+            break
+
+        moved, next_capture, moved_px = _scroll_to_target(curr_capture, target_shift_px)
+        if not moved:
+            print(f"scroll no longer effective (moved={moved_px:.2f}px), stop scrolling")
+            break
+        time.sleep(max(0.03, pause / 4))
+
+    return captures
+
+
+def scroll_and_collect_stitched(
+    window,
+    rounds: int,
+    pause: float,
+    region: tuple[int, int, int, int] | None = None,
+    debug_dir: str | None = None,
+    color_config: dict[str, Any] | None = None,
+    progress_callback=None,
+) -> tuple[list[dict[str, Any]], int]:
+    captures = scroll_capture_images(
+        window,
+        rounds=rounds,
+        pause=pause,
+        region=region,
+        progress_callback=progress_callback,
+    )
+    if not captures:
+        return [], 0
+
+    if debug_dir:
+        Path(debug_dir).mkdir(parents=True, exist_ok=True)
+        for idx, img in enumerate(captures, start=1):
+            cv2.imwrite(str(Path(debug_dir) / f"capture_{idx:03d}.png"), img)
+
+    stitched = stitch_scrolled_captures(captures)
+    stitched_debug_dir = None
+    if debug_dir:
+        cv2.imwrite(str(Path(debug_dir) / "stitched.png"), stitched)
+        stitched_debug_dir = str(Path(debug_dir) / "stitched_ocr")
+
+    rows = _run_ocr_on_bgr(stitched, debug_dir=stitched_debug_dir, color_config=color_config)
+    return rows, len(captures)
+
+
 def scroll_and_collect(
     window,
     rounds: int,
@@ -369,41 +612,17 @@ def scroll_and_collect(
     color_config: dict[str, Any] | None = None,
     progress_callback=None,
 ) -> list[list[dict[str, Any]]]:
-    if region is None:
-        region = _chat_region(window)
-
-    cx = region[0] + region[2] // 2
-    cy = region[1] + region[3] // 2
-    scroll_amount = max(300, int(region[3] * 0.6))
-
-    pyautogui.click(cx, cy)
-    time.sleep(0.3)
-
-    frames: list[list[dict[str, Any]]] = []
-    seen: set[str] = set()
-
-    for i in range(rounds):
-        if progress_callback:
-            progress_callback(i + 1, rounds)
-
-        frame_debug_dir = str(Path(debug_dir) / f"frame_{i + 1:03d}") if debug_dir else None
-        rows = ocr_chat_region(window, region=region, debug_dir=frame_debug_dir, color_config=color_config)
-        fp = _frame_fingerprint(rows)
-        if fp in seen:
-            print(f"duplicate frame at {i + 1}, stop scrolling")
-            break
-
-        seen.add(fp)
-        frames.append(rows)
-        print(f"captured frame {i + 1}/{rounds}, rows={len(rows)}")
-
-        pyautogui.moveTo(cx, cy)
-        for _ in range(5):
-            pyautogui.scroll(scroll_amount)
-
-        time.sleep(pause)
-
-    return frames
+    rows, capture_count = scroll_and_collect_stitched(
+        window,
+        rounds=rounds,
+        pause=pause,
+        region=region,
+        debug_dir=debug_dir,
+        color_config=color_config,
+        progress_callback=progress_callback,
+    )
+    print(f"captured {capture_count} frames, stitched rows={len(rows)}")
+    return [rows]
 
 
 def merge_scrolled_frames(frames: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
