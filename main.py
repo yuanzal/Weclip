@@ -27,6 +27,8 @@ def main() -> None:
     p.add_argument("--title", default="微信", help="窗口标题关键字")
     p.add_argument("--rounds", type=int, default=1, help="滚动采集次数；1=仅当前屏")
     p.add_argument("--pause", type=float, default=0.8, help="每屏滚动后等待秒数")
+    p.add_argument("--shift-ratio", type=float, default=0.45, help="每屏目标滚动比例（相对视口高度，越小越稳）")
+    p.add_argument("--min-overlap", type=float, default=0.25, help="相邻帧最小重叠比例，不足则停止以防漏消息")
     p.add_argument("--out", default="", help="输出路径；支持 .json 或 .txt，默认按时间生成")
     p.add_argument("--keep-image", default="", help="保存调试截图到指定路径（用于调整坐标）")
     p.add_argument("--debug-dir", default="", help="调试输出目录：保存掩码、气泡框、裁剪图和 debug_log.json")
@@ -83,6 +85,8 @@ def main() -> None:
             args.pause,
             region=user_region,
             debug_dir=args.debug_dir or None,
+            shift_ratio=args.shift_ratio,
+            min_overlap_ratio=args.min_overlap,
         )
 
     out = args.out.strip()

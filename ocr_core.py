@@ -484,55 +484,80 @@ def stitch_scrolled_captures(captures: list[np.ndarray]) -> np.ndarray:
     return stitched
 
 
+def _overlap_ratio(prev_bgr: np.ndarray, curr_bgr: np.ndarray) -> float:
+    """Return matched vertical overlap as a ratio of frame height (0~1)."""
+    h = prev_bgr.shape[0]
+    if h <= 0:
+        return 0.0
+    _, overlap_px, score = _best_vertical_overlap(prev_bgr, curr_bgr)
+    if score > 26.0 or overlap_px <= 0:
+        return 0.0
+    return float(overlap_px) / float(h)
+
+
 def scroll_capture_images(
     window,
     rounds: int,
     pause: float,
     region: tuple[int, int, int, int] | None = None,
     progress_callback=None,
-) -> list[np.ndarray]:
+    shift_ratio: float = 0.45,
+    min_overlap_ratio: float = 0.25,
+) -> tuple[list[np.ndarray], dict[str, Any]]:
+    """
+    Capture scrolled frames with forced overlap.
+    Target shift defaults to ~45% viewport so neighboring frames keep ~55% overlap.
+    """
     if region is None:
         region = _chat_region(window)
 
     cx = region[0] + region[2] // 2
     cy = region[1] + region[3] // 2
-    target_shift_px = max(1.0, float(region[3]))
+    viewport_h = max(1.0, float(region[3]))
+    shift_ratio = max(0.2, min(0.7, float(shift_ratio)))
+    min_overlap_ratio = max(0.15, min(0.6, float(min_overlap_ratio)))
+    target_shift_px = max(1.0, viewport_h * shift_ratio)
 
     pyautogui.click(cx, cy)
     time.sleep(0.3)
 
     captures: list[np.ndarray] = []
-    next_capture: np.ndarray | None = None
+    overlap_ratios: list[float] = []
+    stopped_reason = "completed"
 
     def _scroll_to_target(
         start_img: np.ndarray,
         target_shift: float,
+        *,
+        direction: int = 1,
+        initial_step: int | None = None,
     ) -> tuple[bool, np.ndarray, float]:
         img_prev = start_img
         img_last = start_img
         moved_px = 0.0
         no_move_streak = 0
 
-        # Wheel unit is not pixel-based, so use feedback loop to tune step size.
-        step_units = max(60, int(region[3] / 8))
-        min_step_units = 30
-        max_step_units = max(360, int(region[3] * 2))
-        max_scroll_attempts = 12
+        # Conservative wheel steps: avoid jumping more than one viewport.
+        step_units = initial_step if initial_step is not None else max(20, int(region[3] / 20))
+        min_step_units = 12
+        max_step_units = max(80, int(region[3] / 4))
+        max_scroll_attempts = 16
+        sign = 1 if direction >= 0 else -1
 
         pyautogui.moveTo(cx, cy)
         for _ in range(max_scroll_attempts):
             if moved_px >= target_shift:
                 break
 
-            pyautogui.scroll(step_units)
-            time.sleep(max(0.02, pause / 8))
+            pyautogui.scroll(sign * step_units)
+            time.sleep(max(0.03, pause / 6))
             img_now = _capture_region_bgr(region)
             img_last = img_now
             shift_y = _estimate_vertical_shift(img_prev, img_now)
 
             if shift_y < 1.5:
                 no_move_streak += 1
-                step_units = min(max_step_units, int(step_units * 1.6))
+                step_units = min(max_step_units, max(min_step_units, int(step_units * 1.35)))
                 if no_move_streak >= 2:
                     break
                 continue
@@ -545,12 +570,45 @@ def scroll_capture_images(
                 break
 
             gain = shift_y / max(step_units, 1)
-            desired = int(remaining / max(gain, 0.05))
+            desired = int(remaining / max(gain, 0.08))
             step_units = max(min_step_units, min(max_step_units, desired))
             img_prev = img_now
 
         return (moved_px >= 3.0), img_last, moved_px
 
+    def _ensure_overlap(prev_img: np.ndarray, curr_img: np.ndarray) -> tuple[np.ndarray, float, bool]:
+        """
+        Gate neighboring frames by minimum overlap ratio.
+        If overlap is too small (overscrolled), nudge back and recapture.
+        """
+        ratio = _overlap_ratio(prev_img, curr_img)
+        if ratio >= min_overlap_ratio:
+            return curr_img, ratio, True
+
+        corrected = curr_img
+        for attempt in range(4):
+            # Overscrolled: move opposite direction with tiny steps.
+            back_target = max(8.0, viewport_h * (min_overlap_ratio - ratio + 0.08))
+            tiny_step = max(10, int(region[3] / 40))
+            moved, corrected, _ = _scroll_to_target(
+                corrected,
+                back_target,
+                direction=-1,
+                initial_step=tiny_step,
+            )
+            ratio = _overlap_ratio(prev_img, corrected)
+            if ratio >= min_overlap_ratio:
+                return corrected, ratio, True
+            if not moved:
+                break
+            print(
+                f"overlap gate retry {attempt + 1}/4: ratio={ratio:.3f}, "
+                f"need>={min_overlap_ratio:.3f}"
+            )
+
+        return corrected, ratio, ratio >= min_overlap_ratio
+
+    next_capture: np.ndarray | None = None
     for i in range(rounds):
         if progress_callback:
             progress_callback(i + 1, rounds)
@@ -560,13 +618,92 @@ def scroll_capture_images(
         if i >= rounds - 1:
             break
 
-        moved, next_capture, moved_px = _scroll_to_target(curr_capture, target_shift_px)
+        moved, candidate, moved_px = _scroll_to_target(curr_capture, target_shift_px, direction=1)
         if not moved:
+            stopped_reason = f"scroll_ineffective(moved={moved_px:.2f}px)"
             print(f"scroll no longer effective (moved={moved_px:.2f}px), stop scrolling")
             break
+
+        candidate, ratio, ok = _ensure_overlap(curr_capture, candidate)
+        overlap_ratios.append(ratio)
+        if not ok:
+            stopped_reason = f"overlap_insufficient(ratio={ratio:.3f})"
+            print(
+                f"overlap insufficient ({ratio:.3f} < {min_overlap_ratio:.3f}), "
+                "stop scrolling to avoid skipped messages"
+            )
+            # Keep the last candidate only if it still moved; otherwise discard.
+            if ratio > 0.05:
+                captures.append(candidate)
+            break
+
+        next_capture = candidate
         time.sleep(max(0.03, pause / 4))
 
-    return captures
+    avg_overlap = float(sum(overlap_ratios) / len(overlap_ratios)) if overlap_ratios else 0.0
+    stats = {
+        "capture_count": len(captures),
+        "avg_overlap_ratio": avg_overlap,
+        "overlap_ratios": overlap_ratios,
+        "shift_ratio": shift_ratio,
+        "min_overlap_ratio": min_overlap_ratio,
+        "stopped_reason": stopped_reason,
+    }
+    return captures, stats
+
+
+def scroll_and_collect_frames(
+    window,
+    rounds: int,
+    pause: float,
+    region: tuple[int, int, int, int] | None = None,
+    debug_dir: str | None = None,
+    color_config: dict[str, Any] | None = None,
+    progress_callback=None,
+    shift_ratio: float = 0.45,
+    min_overlap_ratio: float = 0.25,
+) -> tuple[list[list[dict[str, Any]]], dict[str, Any]]:
+    """
+    Primary scroll path: capture with overlap, OCR each frame, return frames for message merge.
+    Stitched image is saved for debug only.
+    """
+    captures, capture_stats = scroll_capture_images(
+        window,
+        rounds=rounds,
+        pause=pause,
+        region=region,
+        progress_callback=progress_callback,
+        shift_ratio=shift_ratio,
+        min_overlap_ratio=min_overlap_ratio,
+    )
+    if not captures:
+        return [], {**capture_stats, "merged_count": 0}
+
+    if debug_dir:
+        Path(debug_dir).mkdir(parents=True, exist_ok=True)
+        for idx, img in enumerate(captures, start=1):
+            cv2.imwrite(str(Path(debug_dir) / f"capture_{idx:03d}.png"), img)
+        try:
+            stitched = stitch_scrolled_captures(captures)
+            cv2.imwrite(str(Path(debug_dir) / "stitched.png"), stitched)
+        except Exception as e:
+            print(f"warning: stitch debug image skipped — {e}")
+
+    frames: list[list[dict[str, Any]]] = []
+    for idx, img in enumerate(captures, start=1):
+        frame_debug = str(Path(debug_dir) / f"frame_{idx:03d}_ocr") if debug_dir else None
+        rows = _run_ocr_on_bgr(img, debug_dir=frame_debug, color_config=color_config)
+        frames.append(rows)
+        if progress_callback:
+            progress_callback(idx, len(captures))
+
+    merged = merge_scrolled_frames(frames)
+    stats = {
+        **capture_stats,
+        "merged_count": len(merged),
+        "per_frame_counts": [len(f) for f in frames],
+    }
+    return frames, stats
 
 
 def scroll_and_collect_stitched(
@@ -577,30 +714,23 @@ def scroll_and_collect_stitched(
     debug_dir: str | None = None,
     color_config: dict[str, Any] | None = None,
     progress_callback=None,
-) -> tuple[list[dict[str, Any]], int]:
-    captures = scroll_capture_images(
+    shift_ratio: float = 0.45,
+    min_overlap_ratio: float = 0.25,
+) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
+    """Compatibility wrapper: returns merged rows from per-frame OCR path."""
+    frames, stats = scroll_and_collect_frames(
         window,
         rounds=rounds,
         pause=pause,
         region=region,
+        debug_dir=debug_dir,
+        color_config=color_config,
         progress_callback=progress_callback,
+        shift_ratio=shift_ratio,
+        min_overlap_ratio=min_overlap_ratio,
     )
-    if not captures:
-        return [], 0
-
-    if debug_dir:
-        Path(debug_dir).mkdir(parents=True, exist_ok=True)
-        for idx, img in enumerate(captures, start=1):
-            cv2.imwrite(str(Path(debug_dir) / f"capture_{idx:03d}.png"), img)
-
-    stitched = stitch_scrolled_captures(captures)
-    stitched_debug_dir = None
-    if debug_dir:
-        cv2.imwrite(str(Path(debug_dir) / "stitched.png"), stitched)
-        stitched_debug_dir = str(Path(debug_dir) / "stitched_ocr")
-
-    rows = _run_ocr_on_bgr(stitched, debug_dir=stitched_debug_dir, color_config=color_config)
-    return rows, len(captures)
+    merged = merge_scrolled_frames(frames)
+    return merged, int(stats.get("capture_count", 0)), stats
 
 
 def scroll_and_collect(
@@ -611,8 +741,10 @@ def scroll_and_collect(
     debug_dir: str | None = None,
     color_config: dict[str, Any] | None = None,
     progress_callback=None,
+    shift_ratio: float = 0.45,
+    min_overlap_ratio: float = 0.25,
 ) -> list[list[dict[str, Any]]]:
-    rows, capture_count = scroll_and_collect_stitched(
+    frames, stats = scroll_and_collect_frames(
         window,
         rounds=rounds,
         pause=pause,
@@ -620,12 +752,26 @@ def scroll_and_collect(
         debug_dir=debug_dir,
         color_config=color_config,
         progress_callback=progress_callback,
+        shift_ratio=shift_ratio,
+        min_overlap_ratio=min_overlap_ratio,
     )
-    print(f"captured {capture_count} frames, stitched rows={len(rows)}")
-    return [rows]
+    print(
+        f"captured {stats.get('capture_count', 0)} frames, "
+        f"avg_overlap={stats.get('avg_overlap_ratio', 0):.3f}, "
+        f"merged={stats.get('merged_count', 0)}, "
+        f"stop={stats.get('stopped_reason')}"
+    )
+    return frames
 
 
 def merge_scrolled_frames(frames: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """
+    Merge per-frame OCR results in chat chronological order (top=older → bottom=newer).
+
+    Supports both scroll directions:
+    - scroll down / content up: new frame overlaps at bottom of previous → append
+    - scroll up / older history: new frame overlaps at top of previous → prepend
+    """
     merged: list[dict[str, Any]] = []
     for rows in frames:
         normalized_rows = [
@@ -639,25 +785,38 @@ def merge_scrolled_frames(frames: list[list[dict[str, Any]]]) -> list[dict[str, 
         ]
         if not normalized_rows:
             continue
-        overlap = _find_overlap_size(merged, normalized_rows)
-        merged.extend(normalized_rows[overlap:])
-    return merged
+        if not merged:
+            merged = normalized_rows
+            continue
+
+        mode, overlap = _find_best_overlap(merged, normalized_rows)
+        if mode == "append":
+            merged.extend(normalized_rows[overlap:])
+        elif mode == "prepend":
+            merged = normalized_rows[: len(normalized_rows) - overlap] + merged
+        else:
+            # No reliable contiguous overlap: fall back to message-level inflation control.
+            merged = _merge_by_unique_keys(merged, normalized_rows)
+
+    return _dedupe_near_repeats(_collapse_adjacent_duplicates(merged))
 
 
-def _find_overlap_size(
-    merged: list[dict[str, Any]],
-    rows: list[dict[str, Any]],
-    max_window: int = 12,
-) -> int:
-    if not merged or not rows:
-        return 0
-    max_overlap = min(len(merged), len(rows), max_window)
-    for size in range(max_overlap, 0, -1):
-        tail = merged[-size:]
-        head = rows[:size]
-        if _rows_match(tail, head):
-            return size
-    return 0
+def _message_key(row: dict[str, Any]) -> tuple[str, str]:
+    return (str(row.get("sender", "")), _normalize_message_text(row.get("content", "")))
+
+
+def _texts_equivalent(a: str, b: str) -> bool:
+    na = _normalize_message_text(a)
+    nb = _normalize_message_text(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    # Tolerate minor OCR drift on the same bubble across frames.
+    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if len(shorter) >= 4 and shorter in longer and len(shorter) / len(longer) >= 0.75:
+        return True
+    return False
 
 
 def _rows_match(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> bool:
@@ -666,9 +825,117 @@ def _rows_match(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> bool
     for a, b in zip(left, right):
         if a.get("sender") != b.get("sender"):
             return False
-        if _normalize_message_text(a.get("content", "")) != _normalize_message_text(b.get("content", "")):
+        if not _texts_equivalent(str(a.get("content", "")), str(b.get("content", ""))):
             return False
     return True
+
+
+def _find_overlap_size(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+    max_window: int = 20,
+) -> int:
+    """Longest size where left[-size:] matches right[:size]."""
+    if not left or not right:
+        return 0
+    max_overlap = min(len(left), len(right), max_window)
+    for size in range(max_overlap, 0, -1):
+        if _rows_match(left[-size:], right[:size]):
+            return size
+    return 0
+
+
+def _find_best_overlap(
+    merged: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    max_window: int = 20,
+) -> tuple[str, int]:
+    """
+    Return (mode, overlap_size):
+    - append: merged tail == rows head  (newer content below)
+    - prepend: rows tail == merged head (older content above)
+    - none: no reliable overlap
+    """
+    append_ov = _find_overlap_size(merged, rows, max_window=max_window)
+    prepend_ov = _find_overlap_size(rows, merged, max_window=max_window)
+
+    # Prefer the larger overlap; require at least 1 matching message.
+    if append_ov == 0 and prepend_ov == 0:
+        return ("none", 0)
+    if prepend_ov > append_ov:
+        return ("prepend", prepend_ov)
+    if append_ov > prepend_ov:
+        return ("append", append_ov)
+    # Tie: WeChat history scroll usually reveals older messages (prepend).
+    return ("prepend", prepend_ov)
+
+
+def _merge_by_unique_keys(
+    merged: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Fallback when contiguous overlap fails.
+    Keep chronological order by prepending unseen older messages and appending unseen newer ones.
+    """
+    merged_keys = {_message_key(r) for r in merged}
+    # Prefer treating unmatched frame as older history (common when scrolling up).
+    new_older = [r for r in rows if _message_key(r) not in merged_keys]
+    if not new_older:
+        return merged
+
+    # Decide side by comparing first/last key proximity.
+    # If frame's last messages look like merged's first → prepend.
+    # If frame's first messages look like merged's last → append.
+    head_hit = 0
+    tail_hit = 0
+    probe = min(3, len(rows), len(merged))
+    for i in range(probe):
+        if _rows_match([rows[-(i + 1)]], [merged[i]]):
+            head_hit += 1
+        if _rows_match([rows[i]], [merged[-(i + 1)]]):
+            tail_hit += 1
+
+    if head_hit >= tail_hit:
+        return new_older + merged
+    return merged + new_older
+
+
+def _collapse_adjacent_duplicates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    out = [rows[0]]
+    for row in rows[1:]:
+        prev = out[-1]
+        if prev.get("sender") == row.get("sender") and _texts_equivalent(
+            str(prev.get("content", "")),
+            str(row.get("content", "")),
+        ):
+            # Keep higher confidence copy.
+            prev_conf = float(prev.get("confidence") or 0.0)
+            row_conf = float(row.get("confidence") or 0.0)
+            if row_conf > prev_conf:
+                out[-1] = row
+            continue
+        out.append(row)
+    return out
+
+
+def _dedupe_near_repeats(rows: list[dict[str, Any]], window: int = 20) -> list[dict[str, Any]]:
+    """
+    Drop overlap leftovers that reappear shortly after an earlier copy.
+    Keeps intentional repeats that are far apart.
+    """
+    if not rows:
+        return []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        key = _message_key(row)
+        recent = {_message_key(r) for r in out[-window:]}
+        if key in recent:
+            continue
+        out.append(row)
+    return out
 
 
 def _normalize_message_text(text: str) -> str:

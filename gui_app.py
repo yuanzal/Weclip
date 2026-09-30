@@ -23,8 +23,7 @@ from ocr_core import (
     export_txt,
     get_wechat_window,
     merge_scrolled_frames,
-    scroll_and_collect,
-    scroll_and_collect_stitched,
+    scroll_and_collect_frames,
     select_region_interactive,
 )
 
@@ -72,6 +71,8 @@ class OcrTunerGUI:
         self.v_tol = tk.IntVar(value=60)
         self.scroll_rounds = tk.IntVar(value=5)
         self.scroll_pause = tk.DoubleVar(value=0.8)
+        self.scroll_shift_ratio = tk.DoubleVar(value=0.45)
+        self.min_overlap_ratio = tk.DoubleVar(value=0.25)
         self.save_debug = tk.BooleanVar(value=True)
         self.out_path = tk.StringVar(value=str(Path.cwd() / "wechat_export_gui.txt"))
         self.debug_dir = tk.StringVar(value=str(Path.cwd() / "debug_gui"))
@@ -82,6 +83,8 @@ class OcrTunerGUI:
         self.show_mask_var = tk.BooleanVar(value=False)
         self.show_bubbles_var = tk.BooleanVar(value=False)
         self.highlighter: tk.Toplevel | None = None
+        self.progress_win: tk.Toplevel | None = None
+        self.progress_label: tk.Label | None = None
 
         self._build_layout()
 
@@ -191,6 +194,8 @@ class OcrTunerGUI:
         self._add_entry(lf_setup, "窗口标题:", self.window_title)
         self._add_entry(lf_setup, "滚动屏数:", self.scroll_rounds, is_spin=True, _from=2, _to=100)
         self._add_entry(lf_setup, "滚动间隔:", self.scroll_pause, is_spin=True, _from=0.2, _to=5.0)
+        self._add_entry(lf_setup, "滚动比例:", self.scroll_shift_ratio, is_spin=True, _from=0.2, _to=0.7)
+        self._add_entry(lf_setup, "最小重叠:", self.min_overlap_ratio, is_spin=True, _from=0.15, _to=0.6)
 
         ttk.Separator(lf_setup, orient="horizontal").pack(fill=tk.X, pady=8, padx=10)
 
@@ -222,7 +227,16 @@ class OcrTunerGUI:
         frame.pack(fill=tk.X, padx=10, pady=4)
         ttk.Label(frame, text=label, width=10).pack(side=tk.LEFT)
         if is_spin:
-            ttk.Spinbox(frame, from_=_from, to=_to, textvariable=var, width=10).pack(side=tk.LEFT)
+            # Support float vars (scroll ratio / overlap) with finer increment.
+            increment = 0.05 if isinstance(var, tk.DoubleVar) else 1
+            ttk.Spinbox(
+                frame,
+                from_=_from,
+                to=_to,
+                textvariable=var,
+                width=10,
+                increment=increment,
+            ).pack(side=tk.LEFT)
         else:
             ttk.Entry(frame, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
@@ -308,10 +322,9 @@ class OcrTunerGUI:
             self.refresh_preview()
 
     def show_scroll_highlighter(self, region):
-        if self.highlighter:
-            self.highlighter.destroy()
+        self._close_overlay_windows()
         x, y, w, h = region
-        self.highlighter = tk.Toplevel()
+        self.highlighter = tk.Toplevel(self.root)
         self.highlighter.overrideredirect(True)
         self.highlighter.attributes("-topmost", True)
         self.highlighter.attributes("-transparentcolor", "#000001")
@@ -319,41 +332,121 @@ class OcrTunerGUI:
         canvas = tk.Canvas(self.highlighter, width=w + 14, height=h + 14, bg="#000001", highlightthickness=0)
         canvas.pack()
         canvas.create_rectangle(2, 2, w + 12, h + 12, outline="red", width=3, dash=(10, 5))
-        self.root.update()
+        self.root.update_idletasks()
+
+    def show_progress_overlay(self, text: str = "正在自动滚动识别，请稍候...") -> None:
+        if self.progress_win is not None:
+            try:
+                self.progress_win.destroy()
+            except tk.TclError:
+                pass
+            self.progress_win = None
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg="#1f2d3d")
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        ww, wh = 420, 110
+        win.geometry(f"{ww}x{wh}+{(sw - ww) // 2}+{(sh - wh) // 2}")
+
+        tk.Label(
+            win,
+            text="WeChat OCR",
+            fg="#9ec5ff",
+            bg="#1f2d3d",
+            font=(self.ui_font_family, 10),
+        ).pack(pady=(14, 2))
+        self.progress_label = tk.Label(
+            win,
+            text=text,
+            fg="#ffffff",
+            bg="#1f2d3d",
+            font=(self.ui_font_family, 12, "bold"),
+            wraplength=380,
+            justify="center",
+        )
+        self.progress_label.pack(padx=16, pady=(4, 14))
+        self.progress_win = win
+        win.update()
+
+    def update_progress_overlay(self, text: str) -> None:
+        self.status.set(text)
+        if self.progress_label is not None:
+            try:
+                self.progress_label.configure(text=text)
+                if self.progress_win is not None:
+                    self.progress_win.update()
+                return
+            except tk.TclError:
+                pass
+        try:
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+
+    def _close_overlay_windows(self) -> None:
+        for attr in ("highlighter", "progress_win"):
+            win = getattr(self, attr, None)
+            if win is None:
+                continue
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+            setattr(self, attr, None)
+        self.progress_label = None
+
+    def _restore_main_window(self) -> None:
+        self._close_overlay_windows()
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(200, lambda: self.root.attributes("-topmost", False))
+            self.root.focus_force()
+            self.root.update()
+        except tk.TclError:
+            pass
 
     def run_scroll_ocr_export(self) -> None:
         if self.selected_region is None:
-            messagebox.showinfo("提示", "请先点击“框选截图”确定采集区域。")
+            messagebox.showinfo("提示", "请先点击“框选截图”确定采集区域。", parent=self.root)
             return
 
         out = self._validate_out_path()
         if not out:
+            messagebox.showinfo("提示", "请先设置导出文件路径。", parent=self.root)
             return
 
         rounds = self.scroll_rounds.get()
         pause = self.scroll_pause.get()
+        shift_ratio = float(self.scroll_shift_ratio.get())
+        min_overlap = float(self.min_overlap_ratio.get())
         title = self.window_title.get().strip() or "WeChat"
         win = get_wechat_window(title)
         if win is None:
-            messagebox.showerror("错误", f"未找到窗口：{title}")
+            messagebox.showerror("错误", f"未找到窗口：{title}", parent=self.root)
             return
 
-        msg = "即将开始自动滚动识别。\n请不要移动鼠标。"
-        if not messagebox.askokcancel("确认", msg):
+        msg = "即将开始自动滚动识别（重叠安全 + 分帧 OCR）。\n请不要移动鼠标。"
+        if not messagebox.askokcancel("确认", msg, parent=self.root):
             return
 
         self.root.withdraw()
         self.show_scroll_highlighter(self.selected_region)
-        self.status.set("Auto OCR starting...")
+        self.show_progress_overlay("准备开始自动滚动，请稍候...")
 
         def update_progress(curr, total):
-            self.status.set(f"Progress: {curr}/{total} capturing...")
-            self.root.update()
+            self.update_progress_overlay(f"进度 {curr}/{total}\n正在捕获并识别，请勿操作鼠标")
 
+        result_msg = ""
+        errored = False
         try:
             color_cfg = self._current_color_config()
             dbg = self._prepare_debug_dir()
-            rows, captured_frames = scroll_and_collect_stitched(
+            frames, stats = scroll_and_collect_frames(
                 win,
                 rounds=rounds,
                 pause=pause,
@@ -361,17 +454,49 @@ class OcrTunerGUI:
                 debug_dir=dbg,
                 color_config=color_cfg,
                 progress_callback=update_progress,
+                shift_ratio=shift_ratio,
+                min_overlap_ratio=min_overlap,
             )
-            self._export_frames([rows], out, {"mode": "gui_scroll_stitched"})
-            self.status.set(f"滚动识别完成：采集 {captured_frames} 屏，识别 {len(rows)} 条消息")
-            messagebox.showinfo("完成", f"导出完成\n采集屏数：{captured_frames}\n消息总数：{len(rows)}")
+            self.update_progress_overlay("识别完成，正在导出文件...")
+            merged = merge_scrolled_frames(frames)
+            captured_frames = int(stats.get("capture_count", 0))
+            avg_overlap = float(stats.get("avg_overlap_ratio", 0.0))
+            stop_reason = stats.get("stopped_reason", "")
+            self._export_frames(
+                frames,
+                out,
+                {
+                    "generated_utc": datetime.now(timezone.utc).isoformat(),
+                    "mode": "gui_scroll_per_frame",
+                    "scroll_stats": stats,
+                    "shift_ratio": shift_ratio,
+                    "min_overlap_ratio": min_overlap,
+                },
+            )
+            self.status.set(
+                f"滚动完成：{captured_frames} 屏，平均重叠 {avg_overlap:.0%}，合并 {len(merged)} 条"
+            )
+            result_msg = (
+                f"导出完成\n"
+                f"采集屏数：{captured_frames}\n"
+                f"平均重叠：{avg_overlap:.0%}\n"
+                f"消息总数：{len(merged)}\n"
+                f"停止原因：{stop_reason}\n"
+                f"文件：{out}"
+            )
+        except Exception as e:
+            errored = True
+            self.status.set(f"滚动识别失败：{e}")
+            result_msg = f"滚动识别失败：\n{e}"
         finally:
-            if self.highlighter:
-                self.highlighter.destroy()
-            self.highlighter = None
-            self.root.deiconify()
-            self.root.lift()
-            self.root.focus_force()
+            # 必须先关掉红框并恢复主窗口，再弹提示，否则看起来像“卡住无提示”
+            self._restore_main_window()
+
+        if result_msg:
+            if errored:
+                messagebox.showerror("失败", result_msg, parent=self.root)
+            else:
+                messagebox.showinfo("完成", result_msg, parent=self.root)
 
     def _show_image(self, img_bgr: np.ndarray) -> None:
         self.root.update_idletasks()
